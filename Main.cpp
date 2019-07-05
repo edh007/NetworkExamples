@@ -1,36 +1,71 @@
-#include "Main.h"
+//gcc -o CS260Assignment2.exe main.cpp -std=gnu++11
 
-int main(int argc, char* argv[])
-{
-	if (Init() == SOCKET_ERROR)
-	{
-		WSACleanup();
-		return 0;
-	}
-	SOCKET socket = CreateSocket(IPPROTO_UDP);
-	Update(socket, argv[0]);
-	closesocket(socket);
-	WSACleanup();
-	return 0;
-}
+//#include <iostream>
+#include <chrono>
+#include <thread>
+
+#ifdef _WIN32
+#include <WinSock2.h>
+#include <Ws2tcpip.h>
+
+#define GetLastError() WSAGetLastError()
+
+#else
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+
+typedef int SOCKET;
+
+#define GetLastError() errno
+#define closesocket close
+
+#define INVALID_SOCKET (SOCKET)(~0)
+#define SOCKET_ERROR (-1)
+#define NO_ERROR (0L)
+#define WSACleanup() ;
+#define SD_SEND 0x01
+
+#define ioctlsocket ioctl
+
+#endif
+
+#define BUFFER_MAXLENGTH 512
 
 int Init()
 {
+#ifdef _WIN32
 	WSADATA wsa;
 
 	return WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+    return 0;
+#endif
 }
 
 SOCKET CreateSocket(int protocol)
 {
 	SOCKET result = INVALID_SOCKET;
-
 	int type = SOCK_DGRAM;
 	if (protocol == IPPROTO_TCP)
 		type = SOCK_STREAM;
 
 	result = socket(AF_INET, type, protocol);
-
+	if (result != INVALID_SOCKET && protocol == IPPROTO_TCP)
+	{
+		u_long mode = 1;
+		int err = ioctlsocket(result, FIONBIO, &mode);
+		if (err != NO_ERROR)
+		{
+			closesocket(result);
+			result = INVALID_SOCKET;
+		}
+	}
 	return result;
 }
 
@@ -39,10 +74,14 @@ sockaddr_in* CreateAddress(char* ip, int port)
 	sockaddr_in* result =
 		(sockaddr_in*)calloc(sizeof(*result), 1);
 	result->sin_family = AF_INET;
-	result->sin_port = htons(port);
+	result->sin_port = htons((u_short)port);
 
 	if (ip == NULL)
+#ifdef _WIN32
 		result->sin_addr.S_un.S_addr = INADDR_ANY;
+#else
+        result->sin_addr.s_addr = INADDR_ANY;
+#endif
 	else
 		inet_pton(result->sin_family, ip,
 			&(result->sin_addr));
@@ -50,86 +89,120 @@ sockaddr_in* CreateAddress(char* ip, int port)
 	// Caller will be responsible for free()
 }
 
-int Bind(SOCKET sock, sockaddr_in* addr)
+int Connect(SOCKET sock, sockaddr_in* address)
 {
-	int size = sizeof(sockaddr_in);
-	int result = bind(sock, (sockaddr*)addr, size);
-	if (result == SOCKET_ERROR)
+	if (connect(sock, (sockaddr*)address, sizeof(sockaddr_in)) == SOCKET_ERROR)
 		return GetLastError();
-
-	return 0;
+	else
+		return 0;
 }
 
-int Send(SOCKET sock, char* buffer, int bytes, sockaddr_in* dest)
+int SendTCP(SOCKET sock, char* buffer, int bytes)
 {
-	int result = sendto(sock, buffer, bytes, 0, (sockaddr*)dest, sizeof(sockaddr_in));
+	int result = send(sock, buffer, bytes, 0);
 	if (result == SOCKET_ERROR)
 		return -1;
 	else
 		return result;
 }
 
-int Receive(SOCKET sock, char* buffer, int maxBytes)
+int ReceiveTCP(SOCKET sock, char* buffer, int maxBytes)
 {
-	sockaddr sender;
-	int size = sizeof(sockaddr);
-
-	int bytes = recvfrom(sock, buffer, maxBytes, 0, &sender, &size);
+	int bytes = recv(sock, buffer, maxBytes, 0);
 	if (bytes == SOCKET_ERROR)
 		return -1;
-
-	// Sender¡¯s IP address is now in sender.sa_data
-
 	return bytes;
 }
 
-int Connect(SOCKET sock, sockaddr_in* address)
+
+void Close(SOCKET sock, bool now)
 {
-	if (connect(sock, (sockaddr*)address, sizeof(sockaddr_in)) == SOCKET_ERROR)
-		return WSAGetLastError();
+	if (now)
+		closesocket(sock);
 	else
-		return 0;
+		shutdown(sock, SD_SEND);
 }
 
 void Update(SOCKET socket, const char* name)
 {
-	sockaddr_in* localAddress = CreateAddress(NULL, 8888); //INADDR_ANY
 	sockaddr_in* serverAddress = CreateAddress("104.131.138.5", 8888);
-	if (int err = Bind(socket, localAddress))
+
+	while (int err = Connect(socket, serverAddress))
 	{
-		std::cout << "error! code : " << err << std::endl;
-		return;
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		printf(".");
+
+#ifdef _WIN32
+		if (err == 10056)
+			break;
+		else if (err != 10035 && err != 10037)
+		{
+			printf("error! code : %i\n", err);
+			return;
+		}
+#else
+		if (err == 106)
+			break;
+		else if (err != 115)
+		{
+			printf("error! code : %i\n", err);
+			return;
+		}
+#endif
 	}
 
 	char buffer[BUFFER_MAXLENGTH];
 	memset(buffer, '\0', BUFFER_MAXLENGTH); //needs to clear out with \0
 	int j = 0;
 	for (int i = 0; *(name + i) != '\0'; ++i)
-		if (*(name + i) == '\\')
+		if (*(name + i) == '\\' || *(name + i) == '/')
 			j = i + 1;
+#ifdef _WIN32
+	strcpy_s(buffer, (name + j));
+#else
 	strcpy(buffer, (name + j));
+#endif
 
-	int sendResult = Send(socket, buffer, strlen(buffer), serverAddress);
-	if (sendResult == -1)
-	{
-		std::cout << "error! code : " << GetLastError() << std::endl;
-		return;
-	}
-	clock_t begin_time = clock();
-	bool success = false;
-	while (clock() - begin_time < 5 * CLOCKS_PER_SEC) //loop only for 5 sec
-	{
-		int receive = Receive(socket, buffer, BUFFER_MAXLENGTH); //this gets into eternal loop, don't know why
-		if (receive != SOCKET_ERROR)
+	while (int sendResult = SendTCP(socket, buffer, strlen(buffer)) != strlen(buffer))
+		if (sendResult == SOCKET_ERROR)
 		{
-			success = true;
-			break;
+			printf("error! code : %i\n", GetLastError());
+			return;
+		}
+
+	Close(socket, false);
+
+	while (int recvResult = ReceiveTCP(socket, buffer, BUFFER_MAXLENGTH) != 0)
+	{
+		std::this_thread::sleep_for(std::chrono::milliseconds(100));
+		printf(".");
+		if (recvResult == SOCKET_ERROR)
+		{
+			printf("error! code : %i\n", GetLastError());
+			return;
 		}
 	}
 
-	if (success)
-		std::cout << buffer << std::endl;
+	Close(socket, true);
 
-	free(localAddress);
+    printf("%s\n", buffer);
+
 	free(serverAddress);
+}
+
+int main(int /*argc*/, char* argv[])
+{
+	if (Init() == SOCKET_ERROR)
+	{
+		WSACleanup();
+		return 0;
+	}
+
+	SOCKET socket = CreateSocket(IPPROTO_TCP);
+
+	Update(socket, argv[0]);
+
+	closesocket(socket);
+	WSACleanup();
+	return 0;
 }
