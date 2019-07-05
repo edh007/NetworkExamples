@@ -36,6 +36,8 @@ typedef int SOCKET;
 #endif
 
 #define BUFFER_MAXLENGTH 512
+#define URL_MAXLENGTH 128
+#define RESULT_MAXLENGTH 4096
 
 int Init()
 {
@@ -71,20 +73,56 @@ SOCKET CreateSocket(int protocol)
 
 sockaddr_in* CreateAddress(char* ip, int port)
 {
-	sockaddr_in* result =
-		(sockaddr_in*)calloc(sizeof(*result), 1);
+	sockaddr_in* result = (sockaddr_in*)calloc(sizeof(*result), 1);
+
 	result->sin_family = AF_INET;
-	result->sin_port = htons((u_short)port);
+	result->sin_port = htons(port);
 
 	if (ip == NULL)
 #ifdef _WIN32
 		result->sin_addr.S_un.S_addr = INADDR_ANY;
-#else
-        result->sin_addr.s_addr = INADDR_ANY;
-#endif
 	else
-		inet_pton(result->sin_family, ip,
-			&(result->sin_addr));
+	{
+		result->sin_addr.S_un.S_addr = inet_addr(ip);
+		if (result->sin_addr.S_un.S_addr == INADDR_NONE)
+		{
+			ADDRINFOA hint;
+			PADDRINFOA ppAddrs;
+			memset(&hint, 0, sizeof(ADDRINFOA));
+			hint.ai_family = AF_INET;
+			int err = getaddrinfo(ip, NULL, &hint, &ppAddrs);
+			if (err != 0)
+				return NULL;
+			else
+			{
+				result->sin_addr = ((SOCKADDR_IN*)ppAddrs->ai_addr)->sin_addr;
+				freeaddrinfo(ppAddrs);
+			}
+		}
+	}
+#else
+		result->sin_addr.s_addr = INADDR_ANY;
+	else
+	{
+		result->sin_addr.s_addr = inet_addr(ip);
+		if (result->sin_addr.s_addr == INADDR_NONE)
+		{
+			struct addrinfo hint;
+			struct addrinfo* ppAddrs;
+			memset(&hint, 0, sizeof(struct addrinfo));
+			hint.ai_family = AF_INET;
+			int err = getaddrinfo(ip, NULL, &hint, &ppAddrs);
+			if (err != 0)
+				return NULL;
+			else
+			{
+				result->sin_addr = ((struct sockaddr_in*)ppAddrs->ai_addr)->sin_addr;
+				freeaddrinfo(ppAddrs);
+			}
+		}
+	}
+#endif
+	
 	return result;
 	// Caller will be responsible for free()
 }
@@ -114,7 +152,6 @@ int ReceiveTCP(SOCKET sock, char* buffer, int maxBytes)
 	return bytes;
 }
 
-
 void Close(SOCKET sock, bool now)
 {
 	if (now)
@@ -123,19 +160,49 @@ void Close(SOCKET sock, bool now)
 		shutdown(sock, SD_SEND);
 }
 
-void Update(SOCKET socket, const char* name)
+void Update(SOCKET socket, const char* URL)
 {
-	sockaddr_in* serverAddress = CreateAddress("104.131.138.5", 8888);
+	//changing URL into Hostname
+	int slashCount = 0;
+	int host = 0;
+	int command = 0;
+	char hostname[URL_MAXLENGTH] = { 0 };
+	char getCommand[URL_MAXLENGTH] = { 0 };
+	for (int i = 0; URL[i] != '\0'; ++i)
+	{
+		switch (slashCount)
+		{
+		case 2:
+			if (URL[i] != '/')
+				hostname[host++] = URL[i];
+
+		default:
+			if (URL[i] == '/')
+				++slashCount;
+			break;
+
+		case 3:
+			getCommand[command++] = URL[i];
+		}	
+	}
+	printf("host: %s\n", hostname);
+
+	sockaddr_in* serverAddress = CreateAddress(hostname, 80);
+
+	//checking address
+	const int len = 20;
+	char buf[len];
+
+	inet_ntop(AF_INET, &(serverAddress->sin_addr), buf, len);
+	printf("address: %s\n", buf);
+	//
 
 	while (int err = Connect(socket, serverAddress))
 	{
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		printf(".");
-
 #ifdef _WIN32
-		if (err == 10056)
+		if (err == WSAEISCONN)
 			break;
-		else if (err != 10035 && err != 10037)
+		if (err == INVALID_SOCKET)
 		{
 			printf("error! code : %i\n", err);
 			return;
@@ -143,55 +210,98 @@ void Update(SOCKET socket, const char* name)
 #else
 		if (err == 106)
 			break;
-		else if (err != 115)
+		else if (err != 114 && err != 115)
 		{
 			printf("error! code : %i\n", err);
 			return;
 		}
 #endif
 	}
+	printf("connected! sending request...\n");
 
+	//request pool
 	char buffer[BUFFER_MAXLENGTH];
 	memset(buffer, '\0', BUFFER_MAXLENGTH); //needs to clear out with \0
-	int j = 0;
-	for (int i = 0; *(name + i) != '\0'; ++i)
-		if (*(name + i) == '\\' || *(name + i) == '/')
-			j = i + 1;
 #ifdef _WIN32
-	strcpy_s(buffer, (name + j));
+	strcat_s(buffer, "GET /");
+	strcat_s(buffer, getCommand);
+	strcat_s(buffer, " HTTP/1.1\nHost: ");
+	strcat_s(buffer, hostname);
+	strcat_s(buffer, "\n\n");
 #else
-	strcpy(buffer, (name + j));
+	strcat(buffer, "GET /");
+	strcat(buffer, getCommand);
+	strcat(buffer, " HTTP/1.1\nHost: ");
+	strcat(buffer, hostname);
+	strcat(buffer, "\n\n");
 #endif
 
-	while (int sendResult = SendTCP(socket, buffer, strlen(buffer)) != strlen(buffer))
+	while (int sendResult = SendTCP(socket, buffer, strlen(buffer)) != (int)strlen(buffer))
 		if (sendResult == SOCKET_ERROR)
 		{
-			printf("error! code : %i\n", GetLastError());
+			printf("send error! code : %i\n", GetLastError());
 			return;
 		}
-
 	Close(socket, false);
 
+	printf("\nsent message:\n");
+	printf("%s",buffer);
+	printf("\n");
+
+
+	int rcvMsgIter = 0;
+	char receivedMsg[RESULT_MAXLENGTH] = { 0 };
+	memset(buffer, '\0', BUFFER_MAXLENGTH); //needs to clear out with \0
 	while (int recvResult = ReceiveTCP(socket, buffer, BUFFER_MAXLENGTH) != 0)
 	{
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-		printf(".");
 		if (recvResult == SOCKET_ERROR)
 		{
-			printf("error! code : %i\n", GetLastError());
+			printf("receive error! code : %i\n", GetLastError());
 			return;
 		}
+
+		bool finished = false;
+		for (int i = 0; i < BUFFER_MAXLENGTH; ++i)
+		{
+			if (rcvMsgIter >= RESULT_MAXLENGTH)
+			{
+				finished = true;
+				break;
+			}
+
+			if (*(buffer + i) == '\0')
+				break;
+
+			receivedMsg[rcvMsgIter++] = *(buffer + i);
+
+			if (*(buffer + i) == ']')
+			{
+				finished = true;
+				break;
+			}
+		}
+
+		if (finished)
+			break;
+
+		memset(buffer, '\0', BUFFER_MAXLENGTH);
 	}
 
 	Close(socket, true);
 
-    printf("%s\n", buffer);
+    printf("%s\n", receivedMsg);
 
 	free(serverAddress);
 }
 
-int main(int /*argc*/, char* argv[])
+int main(int argc, char* argv[])
 {
+	if (argc < 2)
+	{
+		printf("not enough arguments!\n");
+		return 0;
+	}
+
 	if (Init() == SOCKET_ERROR)
 	{
 		WSACleanup();
@@ -200,7 +310,7 @@ int main(int /*argc*/, char* argv[])
 
 	SOCKET socket = CreateSocket(IPPROTO_TCP);
 
-	Update(socket, argv[0]);
+	Update(socket, argv[1]);
 
 	closesocket(socket);
 	WSACleanup();
